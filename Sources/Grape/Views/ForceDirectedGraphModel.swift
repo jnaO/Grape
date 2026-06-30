@@ -16,6 +16,16 @@ public protocol _AnyGraphProxyProtocol {
     @inlinable
     func setNodeFixation<ID: Hashable>(nodeID: ID, fixation: CGPoint?, minimumAlpha: Double)
 
+    /// The node's live position in **simulation** coordinates, or `nil` if the node is unknown.
+    /// Map to the viewport with `finalTransform` if a screen-space value is needed.
+    @inlinable
+    func position<ID: Hashable>(of nodeID: ID) -> SIMD2<Double>?
+
+    /// The node's full live kinetic state (position/velocity/fixation) in **simulation**
+    /// coordinates, or `nil` if the node is unknown.
+    @inlinable
+    func kineticState<ID: Hashable>(of nodeID: ID) -> KineticState?
+
     @inlinable
     var kineticAlpha: Double { get nonmutating set }
 
@@ -763,10 +773,15 @@ extension ForceDirectedGraphModel {
             new
         }
 
+        // SMTM fork: prefer the freshly-built view (mirrors `resolvedTexts` above) so a
+        // content rebuild with new palette colours re-rasterizes the annotation glyph in the
+        // new colour. Upstream kept `old`, which left glyphs stale on a live recolour while the
+        // node circles/strokes (rebuilt from `nodeOperations`) updated. `new` is `.pending`, so
+        // it re-rasterizes on the next render; positions are preserved by `simulationContext.revive`.
         newContext.resolvedViews = self.graphRenderingContext.resolvedViews.merging(
             newContext.resolvedViews
         ) { old, new in
-            old
+            new
         }
 
         newContext.symbols = self.graphRenderingContext.symbols.merging(
