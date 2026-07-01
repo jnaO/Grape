@@ -248,6 +248,27 @@ public final class ForceDirectedGraphModel<NodeID: Hashable> {
     @MainActor
     var colorTransitionTimer: Timer? = nil
 
+    // MARK: - SMTM node fade-in (staggered per-node entrance opacity ramp)
+    /// Configured via `.nodeFadeIn(duration:curve:)`. `duration == 0` disables (nodes draw at full
+    /// alpha — the default, so the fork is zero-risk unless a consumer opts in). Each node fades 0→1
+    /// over `duration` from the moment it first appears; because tiers of nodes are added to the graph
+    /// over time (app-side), this produces a cascaded reveal. Motion-agnostic: the app disables it under
+    /// Reduce Motion simply by passing `duration: 0`.
+    @usableFromInline
+    var nodeFadeInDuration: Double = 0
+    @usableFromInline
+    var nodeFadeInCurve: GraphColorTransitionCurve = .easeInOut
+    /// First-seen timestamp per node, keyed by `StateID`. Stamped lazily in `render` the first frame a
+    /// node is drawn while a fade is enabled — this sidesteps the modifier-runs-after-init ordering
+    /// (initial nodes get stamped on first paint, added tiers on the frame after their `revive`).
+    @usableFromInline
+    var nodeSpawnTimes: [GraphRenderingStates<NodeID>.StateID: Date] = [:]
+    /// Drives per-frame redraws while a fade is in flight on a **paused** sim (Reduce Motion / settled);
+    /// a running sim already repaints via `tick`, so this is only scheduled when `scheduledTimer == nil`.
+    @usableFromInline
+    @MainActor
+    var nodeFadeTimer: Timer? = nil
+
     @usableFromInline
     var _onTicked: ((UInt) -> Void)? = nil
 
@@ -529,6 +550,70 @@ extension ForceDirectedGraphModel {
         self.previousGlyphColors.removeAll()
     }
 
+    // MARK: - SMTM node fade-in
+
+    /// Record a first-seen timestamp for every currently-drawn node that doesn't have one yet, so newly
+    /// appeared nodes (initial build or a `revive`-added tier) begin their fade from `now`. No-op when
+    /// the fade is disabled (`duration == 0`) — zero cost on the default path.
+    @inlinable
+    func stampNodeSpawnTimesIfNeeded(now: Date) {
+        guard nodeFadeInDuration > 0 else { return }
+        for op in graphRenderingContext.nodeOperations {
+            let key = GraphRenderingStates<NodeID>.StateID.node(op.mark.id)
+            if nodeSpawnTimes[key] == nil { nodeSpawnTimes[key] = now }
+        }
+    }
+
+    /// Eased fade-in opacity in `[0, 1]` for a node `StateID`. Returns `1` when the fade is disabled or
+    /// the node has no recorded spawn time (never hide a node we don't know about) or the ramp is done.
+    @inlinable
+    func nodeFadeAlpha(for id: GraphRenderingStates<NodeID>.StateID, now: Date) -> Double {
+        guard nodeFadeInDuration > 0, let start = nodeSpawnTimes[id] else { return 1 }
+        let linear = min(max(now.timeIntervalSince(start) / nodeFadeInDuration, 0), 1)
+        return nodeFadeInCurve.apply(linear)
+    }
+
+    /// True while at least one node is still mid-fade (elapsed < duration).
+    @inlinable
+    func hasNodeFadeInFlight(now: Date) -> Bool {
+        guard nodeFadeInDuration > 0 else { return false }
+        for start in nodeSpawnTimes.values
+        where now.timeIntervalSince(start) < nodeFadeInDuration {
+            return true
+        }
+        return false
+    }
+
+    /// Schedule a redraw clock for the fade ONLY when the sim is paused (`scheduledTimer == nil`) — a
+    /// running sim already repaints every `tick`. Mirrors `colorTransitionTimer`; self-stops when done.
+    @inlinable
+    func startNodeFadeTimerIfNeeded() {
+        guard scheduledTimer == nil, nodeFadeTimer == nil else { return }
+        self.nodeFadeTimer = Timer.scheduledTimer(
+            withTimeInterval: 1.0 / ticksPerSecond,
+            repeats: true
+        ) { [weak self] _ in
+            if let capturedSelf = self {
+                Task { @MainActor [weak capturedSelf] in
+                    capturedSelf?.tickNodeFade()
+                }
+            }
+        }
+    }
+
+    /// Bumps ONLY the redraw clock (not the sim) so a paused graph repaints mid-fade; stops itself once
+    /// every node has finished fading in.
+    @inlinable
+    func tickNodeFade() {
+        withMutation(keyPath: \.currentFrame) {
+            currentFrame += 1
+        }
+        if !hasNodeFadeInFlight(now: Date()) {
+            self.nodeFadeTimer?.invalidate()
+            self.nodeFadeTimer = nil
+        }
+    }
+
     @inlinable
     func render(
         _ graphicsContext: inout GraphicsContext,
@@ -553,6 +638,20 @@ extension ForceDirectedGraphModel {
         // SMTM fork: eased colour-transition progress for this frame (nil = no transition → draw new).
         let colorT = self.colorTransitionProgress
 
+        // SMTM fork: node fade-in. Stamp first-seen times, then precompute each node's eased opacity for
+        // this frame (empty map + `1` fallbacks when the fade is disabled → the fill/glyph/link draws
+        // below stay at full alpha, matching upstream behaviour exactly).
+        let fadeNow = Date()
+        stampNodeSpawnTimesIfNeeded(now: fadeNow)
+        let fadeActive = nodeFadeInDuration > 0
+        var nodeFadeAlphaLookup: [NodeID: Double] = [:]
+        if fadeActive {
+            nodeFadeAlphaLookup.reserveCapacity(graphRenderingContext.nodeOperations.count)
+            for op in graphRenderingContext.nodeOperations {
+                nodeFadeAlphaLookup[op.mark.id] = nodeFadeAlpha(for: .node(op.mark.id), now: fadeNow)
+            }
+        }
+
         for op in graphRenderingContext.linkOperations {
 
             guard let source = simulationContext.nodeIndexLookup[op.mark.id.source],
@@ -563,6 +662,14 @@ extension ForceDirectedGraphModel {
 
             let sourcePos = viewportPositions[source]
             let targetPos = viewportPositions[target]
+
+            // SMTM fork: fade a link with the MIN alpha of its two endpoints so an edge never out-runs
+            // the nodes it connects (1 when the fade is disabled).
+            let linkAlpha =
+                fadeActive
+                ? min(nodeFadeAlphaLookup[op.mark.id.source] ?? 1, nodeFadeAlphaLookup[op.mark.id.target] ?? 1)
+                : 1
+            graphicsContext.opacity = linkAlpha
 
             let p =
                 if let pathBuilder = op.path {
@@ -617,6 +724,8 @@ extension ForceDirectedGraphModel {
             }
         }
 
+        graphicsContext.opacity = 1  // SMTM fork: clear any per-link fade before the node pass.
+
         for op in graphRenderingContext.nodeOperations {
             guard let id = simulationContext.nodeIndexLookup[op.mark.id] else {
                 continue
@@ -624,6 +733,10 @@ extension ForceDirectedGraphModel {
             let pos = viewportPositions[id]
 
             graphicsContext.transform = .init(translationX: pos.x, y: pos.y)
+
+            // SMTM fork: this node's eased fade-in opacity (1 when disabled / done). Applies to both the
+            // fill and stroke below; reset to 1 after the node so it doesn't leak into the glyph pass.
+            graphicsContext.opacity = fadeActive ? (nodeFadeAlphaLookup[op.mark.id] ?? 1) : 1
 
             let finalizedPath: Path =
                 switch op.pathOrSymbolSize {
@@ -675,6 +788,7 @@ extension ForceDirectedGraphModel {
                     graphicsContext.blendMode = .normal
                 }
             }
+            graphicsContext.opacity = 1  // SMTM fork: reset node fade-in before the next node / glyph pass.
         }
         // return
         var newRasterizedSymbols = [(GraphRenderingStates<NodeID>.StateID, CGRect)]()
@@ -683,13 +797,27 @@ extension ForceDirectedGraphModel {
         // closure can read them without touching main-actor state.
         let glyphTints = graphRenderingContext.glyphTints
         let previousGlyphTints = previousGlyphColors
+        // SMTM fork: snapshot the per-node fade alphas (value type) so the nonisolated `withCGContext`
+        // closure can read them; a node glyph fades with its node, a link glyph with its dimmer endpoint.
+        let glyphFadeAlphas = nodeFadeAlphaLookup
         graphicsContext.withCGContext { cgContext in
 
             // SMTM fork: draw a resolved glyph either as a tintable alpha-mask (single-tint glyphs,
-            // so the tint can lerp old→new during a colour transition) or as the plain bitmap.
-            func drawGlyph(_ image: CGImage, in rect: CGRect, id: GraphRenderingStates<NodeID>.StateID) {
+            // so the tint can lerp old→new during a colour transition) or as the plain bitmap. `alpha`
+            // is the node fade-in opacity (1 when disabled / done).
+            func drawGlyph(
+                _ image: CGImage, in rect: CGRect,
+                id: GraphRenderingStates<NodeID>.StateID, alpha: Double = 1
+            ) {
                 guard let newTint = glyphTints[id] else {
-                    cgContext.draw(image, in: rect)
+                    if alpha < 1 {
+                        cgContext.saveGState()
+                        cgContext.setAlpha(alpha)
+                        cgContext.draw(image, in: rect)
+                        cgContext.restoreGState()
+                    } else {
+                        cgContext.draw(image, in: rect)
+                    }
                     return
                 }
                 let tint: Color
@@ -699,6 +827,7 @@ extension ForceDirectedGraphModel {
                     tint = newTint
                 }
                 cgContext.saveGState()
+                cgContext.setAlpha(alpha)  // SMTM fork: applied to the composited tinted glyph.
                 cgContext.beginTransparencyLayer(auxiliaryInfo: nil)
                 cgContext.draw(image, in: rect)  // glyph alpha = shape (tint-independent)
                 cgContext.setBlendMode(.sourceIn)
@@ -706,6 +835,16 @@ extension ForceDirectedGraphModel {
                 cgContext.fill(rect)
                 cgContext.endTransparencyLayer()
                 cgContext.restoreGState()
+            }
+
+            // SMTM fork: fade alpha for a glyph's `StateID` — node glyph tracks its node, link label
+            // tracks the dimmer of its two endpoints.
+            func glyphFadeAlpha(_ id: GraphRenderingStates<NodeID>.StateID) -> Double {
+                switch id {
+                case .node(let nodeID): return glyphFadeAlphas[nodeID] ?? 1
+                case .link(let from, let to):
+                    return min(glyphFadeAlphas[from] ?? 1, glyphFadeAlphas[to] ?? 1)
+                }
             }
 
             for (symbolID, resolvedTextContent) in graphRenderingContext.resolvedTexts {
@@ -760,7 +899,7 @@ extension ForceDirectedGraphModel {
                             width: physicalWidth,
                             height: physicalHeight
                         )
-                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID, alpha: glyphFadeAlpha(symbolID))
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -791,7 +930,7 @@ extension ForceDirectedGraphModel {
                             width: physicalWidth,
                             height: physicalHeight
                         )
-                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID, alpha: glyphFadeAlpha(symbolID))
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -843,7 +982,7 @@ extension ForceDirectedGraphModel {
                             height: physicalHeight
                         )
 
-                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID, alpha: glyphFadeAlpha(symbolID))
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -875,7 +1014,7 @@ extension ForceDirectedGraphModel {
                             height: physicalHeight
                         )
 
-                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID, alpha: glyphFadeAlpha(symbolID))
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -884,6 +1023,12 @@ extension ForceDirectedGraphModel {
         }
 
         rasterizedSymbols = newRasterizedSymbols
+
+        // SMTM fork: if a fade is still in flight while the sim is paused (settled / Reduce Motion),
+        // spin up the redraw clock so the reveal animates without sim ticks (no-op on a running sim).
+        if fadeActive, hasNodeFadeInFlight(now: fadeNow) {
+            startNodeFadeTimerIfNeeded()
+        }
     }
 
     @inlinable

@@ -122,4 +122,21 @@ extension ForceDirectedGraph {
         self.model.colorTransitionCurve = curve
         return self
     }
+
+    /// SMTM fork: enable a **staggered per-node fade-in entrance**. Each node fades its opacity 0→1
+    /// over `duration` from the moment it first appears in the graph; because node tiers are added to
+    /// the content over time (app-side), this yields a cascaded reveal. `duration: 0` disables it
+    /// (nodes draw at full alpha immediately — the default, so the fork is unchanged unless opted in).
+    /// Motion-agnostic: a consumer turns the cascade off under Reduce Motion simply by passing
+    /// `duration: 0`; the fork bakes in no motion variant.
+    @inlinable
+    @MainActor
+    public func nodeFadeIn(
+        duration: Double,
+        curve: GraphColorTransitionCurve = .easeInOut
+    ) -> Self {
+        self.model.nodeFadeInDuration = duration
+        self.model.nodeFadeInCurve = curve
+        return self
+    }
 }
