@@ -41,17 +41,25 @@ extension GraphContentEffect {
         @usableFromInline
         let offset: CGVector
 
+        /// SMTM fork: when non-nil, this annotation is a **single-tint glyph** — the renderer draws
+        /// it as an alpha mask filled with this colour (so it can lerp old→new). Leave nil for
+        /// multi-colour view annotations.
+        @usableFromInline
+        let tint: Color?
+
         @inlinable
         public init(
             _ tag: String,
             _ view: some View,
             alignment: Alignment = .bottom,
-            offset: CGVector = .zero
+            offset: CGVector = .zero,
+            tint: Color? = nil
         ) {
             self.tag = tag
             self.view = .init(erasing: view)
             self.alignment = alignment
             self.offset = offset
+            self.tint = tint
         }
     }
 
@@ -103,6 +111,10 @@ extension GraphContentEffect.ViewAnnotation: GraphContentModifier {
         if let currentID = context.states.currentID {
 
             context.resolvedViews[currentID] = .pending(self.view)
+            // SMTM fork: record the tint for single-tint glyphs so the renderer can mask-and-lerp it.
+            if let tint = self.tint {
+                context.glyphTints[currentID] = tint
+            }
 
             switch currentID {
             case .node(_):

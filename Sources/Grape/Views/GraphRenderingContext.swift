@@ -31,6 +31,13 @@ public struct _GraphRenderingContext<NodeID: Hashable> {
     @usableFromInline
     internal var linkOperations: [RenderOperation<NodeID>.Link] = []
 
+    /// SMTM fork: per-annotation tint `Color` for **single-tint glyph** annotations (e.g. an SF
+    /// Symbol). When present, `render` draws that glyph as an alpha mask filled with this colour
+    /// (lerp-able) instead of the pre-tinted bitmap. Absent for multi-colour view annotations
+    /// (e.g. the account VStack), which draw as-is.
+    @usableFromInline
+    internal var glyphTints: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+
     @inlinable
     internal init() {
 

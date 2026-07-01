@@ -25,7 +25,8 @@ public struct NodeMark<NodeID: Hashable>: GraphContent, Identifiable, Equatable 
                 self,
                 context.states.currentShading,
                 context.states.currentStroke,
-                context.states.currentSymbolShapeOrSize
+                context.states.currentSymbolShapeOrSize,
+                context.states.currentFillColor  // SMTM fork: raw fill Color for colour lerp
             )
         )
         context.states.currentID = .node(id)

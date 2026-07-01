@@ -225,6 +225,29 @@ public final class ForceDirectedGraphModel<NodeID: Hashable> {
     @MainActor
     var scheduledTimer: Timer? = nil
 
+    // MARK: - SMTM colour transition (true per-node colour lerp)
+    /// Configured via `.contentColorTransition(duration:curve:)`. `duration == 0` disables (snap).
+    @usableFromInline
+    var colorTransitionDuration: Double = 0.8
+    @usableFromInline
+    var colorTransitionCurve: GraphColorTransitionCurve = .easeInOut
+    /// Colours captured from the outgoing context at the last colour refresh, keyed by `StateID`;
+    /// the renderer lerps old→new until the transition completes.
+    @usableFromInline
+    var previousFillColors: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+    @usableFromInline
+    var previousStrokeColors: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+    @usableFromInline
+    var previousLinkColors: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+    @usableFromInline
+    var previousGlyphColors: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+    @usableFromInline
+    var colorTransitionStart: Date? = nil
+    /// Drives per-frame redraws during the transition even when the sim is settled (no sim tick).
+    @usableFromInline
+    @MainActor
+    var colorTransitionTimer: Timer? = nil
+
     @usableFromInline
     var _onTicked: ((UInt) -> Void)? = nil
 
@@ -432,6 +455,80 @@ extension ForceDirectedGraphModel {
         self.scheduledTimer = nil
     }
 
+    // MARK: - SMTM colour transition
+
+    /// Begin a true colour cross-fade from the CURRENT (about-to-be-replaced) colours to the incoming
+    /// ones. Called from `revive` BEFORE `graphRenderingContext` is reassigned, so `self.graph…` still
+    /// holds the old colours. Positions are shared (stable ids) — we retain colour only.
+    @inlinable
+    func beginColorTransition() {
+        guard colorTransitionDuration > 0 else { return }
+        var pf: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+        var ps: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+        for op in self.graphRenderingContext.nodeOperations {
+            if let c = op.fillColor { pf[.node(op.mark.id)] = c }
+            if case .color(let c)? = op.stroke?.color { ps[.node(op.mark.id)] = c }
+        }
+        var pl: [GraphRenderingStates<NodeID>.StateID: Color] = [:]
+        for op in self.graphRenderingContext.linkOperations {
+            if case .color(let c)? = op.stroke?.color {
+                pl[.link(op.mark.id.source, op.mark.id.target)] = c
+            }
+        }
+        self.previousFillColors = pf
+        self.previousStrokeColors = ps
+        self.previousLinkColors = pl
+        self.previousGlyphColors = self.graphRenderingContext.glyphTints  // old single-tint glyph colours
+        self.colorTransitionStart = Date()
+        self.startColorTransitionTimer()
+    }
+
+    /// Eased transition progress in `[0, 1]`, or `nil` when no transition is active.
+    @inlinable
+    var colorTransitionProgress: Double? {
+        guard let start = colorTransitionStart, colorTransitionDuration > 0 else { return nil }
+        let linear = min(max(Date().timeIntervalSince(start) / colorTransitionDuration, 0), 1)
+        return colorTransitionCurve.apply(linear)
+    }
+
+    @inlinable
+    func startColorTransitionTimer() {
+        self.colorTransitionTimer?.invalidate()
+        self.colorTransitionTimer = Timer.scheduledTimer(
+            withTimeInterval: 1.0 / ticksPerSecond,
+            repeats: true
+        ) { [weak self] _ in
+            if let capturedSelf = self {
+                Task { @MainActor [weak capturedSelf] in
+                    capturedSelf?.tickColorTransition()
+                }
+            }
+        }
+    }
+
+    /// Bumps ONLY the redraw clock (not the sim) so a settled graph repaints mid-transition.
+    @inlinable
+    func tickColorTransition() {
+        withMutation(keyPath: \.currentFrame) {
+            currentFrame += 1
+        }
+        if let start = colorTransitionStart,
+            Date().timeIntervalSince(start) >= colorTransitionDuration {
+            endColorTransition()
+        }
+    }
+
+    @inlinable
+    func endColorTransition() {
+        self.colorTransitionTimer?.invalidate()
+        self.colorTransitionTimer = nil
+        self.colorTransitionStart = nil
+        self.previousFillColors.removeAll()
+        self.previousStrokeColors.removeAll()
+        self.previousLinkColors.removeAll()
+        self.previousGlyphColors.removeAll()
+    }
+
     @inlinable
     func render(
         _ graphicsContext: inout GraphicsContext,
@@ -452,6 +549,9 @@ extension ForceDirectedGraphModel {
         }
 
         self.finalTransform = transform
+
+        // SMTM fork: eased colour-transition progress for this frame (nil = no transition → draw new).
+        let colorT = self.colorTransitionProgress
 
         for op in graphRenderingContext.linkOperations {
 
@@ -493,9 +593,17 @@ extension ForceDirectedGraphModel {
             if let strokeEffect = op.stroke {
                 switch strokeEffect.color {
                 case .color(let color):
+                    // SMTM fork: lerp link stroke colour old→new during a transition.
+                    let drawColor: Color
+                    if let t = colorT, t < 1,
+                        let old = previousLinkColors[.link(op.mark.id.source, op.mark.id.target)] {
+                        drawColor = lerpColor(old, color, t)
+                    } else {
+                        drawColor = color
+                    }
                     graphicsContext.stroke(
                         p,
-                        with: .color(color),
+                        with: .color(drawColor),
                         style: strokeEffect.style ?? .defaultLinkStyle
                     )
                 case .clip:
@@ -529,16 +637,32 @@ extension ForceDirectedGraphModel {
                     )
                 }
 
+            // SMTM fork: lerp the node fill colour old→new during a transition (else draw the
+            // original shading — gradients/materials, which have no capturable Color, snap).
+            let fillShading: GraphicsContext.Shading
+            if let t = colorT, t < 1, let new = op.fillColor,
+                let old = previousFillColors[.node(op.mark.id)] {
+                fillShading = .color(lerpColor(old, new, t))
+            } else {
+                fillShading = op.fill ?? .defaultNodeShading
+            }
             graphicsContext.fill(
                 finalizedPath,
-                with: op.fill ?? .defaultNodeShading
+                with: fillShading
             )
             if let strokeEffect = op.stroke {
                 switch strokeEffect.color {
                 case .color(let color):
+                    // SMTM fork: lerp node stroke colour old→new during a transition.
+                    let drawColor: Color
+                    if let t = colorT, t < 1, let old = previousStrokeColors[.node(op.mark.id)] {
+                        drawColor = lerpColor(old, color, t)
+                    } else {
+                        drawColor = color
+                    }
                     graphicsContext.stroke(
                         finalizedPath,
-                        with: .color(color),
+                        with: .color(drawColor),
                         style: strokeEffect.style ?? .defaultLinkStyle
                     )
                 case .clip:
@@ -555,7 +679,34 @@ extension ForceDirectedGraphModel {
         // return
         var newRasterizedSymbols = [(GraphRenderingStates<NodeID>.StateID, CGRect)]()
         graphicsContext.transform = .identity.concatenating(CGAffineTransform(scaleX: 1, y: -1))
+        // SMTM fork: snapshot the glyph-tint dicts (value types) so the nonisolated `withCGContext`
+        // closure can read them without touching main-actor state.
+        let glyphTints = graphRenderingContext.glyphTints
+        let previousGlyphTints = previousGlyphColors
         graphicsContext.withCGContext { cgContext in
+
+            // SMTM fork: draw a resolved glyph either as a tintable alpha-mask (single-tint glyphs,
+            // so the tint can lerp old→new during a colour transition) or as the plain bitmap.
+            func drawGlyph(_ image: CGImage, in rect: CGRect, id: GraphRenderingStates<NodeID>.StateID) {
+                guard let newTint = glyphTints[id] else {
+                    cgContext.draw(image, in: rect)
+                    return
+                }
+                let tint: Color
+                if let t = colorT, t < 1, let old = previousGlyphTints[id] {
+                    tint = lerpColor(old, newTint, t)
+                } else {
+                    tint = newTint
+                }
+                cgContext.saveGState()
+                cgContext.beginTransparencyLayer(auxiliaryInfo: nil)
+                cgContext.draw(image, in: rect)  // glyph alpha = shape (tint-independent)
+                cgContext.setBlendMode(.sourceIn)
+                cgContext.setFillColor(platformCGColor(tint))
+                cgContext.fill(rect)
+                cgContext.endTransparencyLayer()
+                cgContext.restoreGState()
+            }
 
             for (symbolID, resolvedTextContent) in graphRenderingContext.resolvedTexts {
 
@@ -609,10 +760,7 @@ extension ForceDirectedGraphModel {
                             width: physicalWidth,
                             height: physicalHeight
                         )
-                        cgContext.draw(
-                            rasterizedSymbol,
-                            in: rect
-                        )
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -643,10 +791,7 @@ extension ForceDirectedGraphModel {
                             width: physicalWidth,
                             height: physicalHeight
                         )
-                        cgContext.draw(
-                            rasterizedSymbol,
-                            in: rect
-                        )
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -698,10 +843,7 @@ extension ForceDirectedGraphModel {
                             height: physicalHeight
                         )
 
-                        cgContext.draw(
-                            rasterizedSymbol,
-                            in: rect
-                        )
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -733,10 +875,7 @@ extension ForceDirectedGraphModel {
                             height: physicalHeight
                         )
 
-                        cgContext.draw(
-                            rasterizedSymbol,
-                            in: rect
-                        )
+                        drawGlyph(rasterizedSymbol, in: rect, id: symbolID)
 
                         newRasterizedSymbols.append((symbolID, rect))
                     }
@@ -789,6 +928,11 @@ extension ForceDirectedGraphModel {
         ) { old, new in
             old
         }
+
+        // SMTM fork: start a true colour cross-fade from the outgoing colours to the incoming ones.
+        // Must run BEFORE reassigning `graphRenderingContext` (it reads the OLD colours). Glyph tints
+        // are captured separately (see `render`'s glyph pass); passed empty here and filled by step 2.
+        self.beginColorTransition()
 
         self.graphRenderingContext = newContext
 

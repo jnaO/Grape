@@ -18,6 +18,15 @@ internal struct GraphRenderingStates<NodeID: Hashable> {
     @inlinable
     var currentShading: GraphicsContext.Shading? { shading.last }
 
+    /// SMTM fork: parallel stack to `shading`, capturing the raw `Color` when a `.foregroundStyle`
+    /// was given a plain `Color` (else `nil`, e.g. gradients/materials). Pushed/popped in lockstep
+    /// with `shading` (same effect types) so the two never desync. Enables true per-node colour lerp.
+    @usableFromInline
+    var fillColor: [Color?] = []
+
+    @inlinable
+    var currentFillColor: Color? { fillColor.last ?? nil }
+
     @usableFromInline
     var stroke: [GraphContentEffect.Stroke] = []
 

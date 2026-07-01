@@ -19,18 +19,24 @@ internal enum RenderOperation<NodeID: Hashable> {
         let stroke: GraphContentEffect.Stroke?
         @usableFromInline
         let pathOrSymbolSize: PathOrSymbolSize
+        /// SMTM fork: the raw fill `Color` when `.foregroundStyle` was a plain `Color` (else `nil`),
+        /// captured alongside the opaque `fill` Shading so the renderer can lerp it colour→colour.
+        @usableFromInline
+        let fillColor: Color?
 
         @inlinable
         init(
             _ mark: NodeMark<NodeID>,
             _ fill: GraphicsContext.Shading?,
             _ stroke: GraphContentEffect.Stroke?,
-            _ pathOrSymbolSize: PathOrSymbolSize
+            _ pathOrSymbolSize: PathOrSymbolSize,
+            _ fillColor: Color? = nil
         ) {
             self.mark = mark
             self.fill = fill
             self.stroke = stroke
             self.pathOrSymbolSize = pathOrSymbolSize
+            self.fillColor = fillColor
         }
     }
 

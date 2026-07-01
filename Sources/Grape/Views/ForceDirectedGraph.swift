@@ -106,3 +106,20 @@ where NodeID == Content.NodeID {
     }
 
 }
+
+extension ForceDirectedGraph {
+    /// SMTM fork: enable a **true per-node colour cross-fade** when the graph content recolours
+    /// (Grape draws to a `Canvas`, which doesn't receive SwiftUI's implicit colour animation, so it
+    /// would otherwise snap). `duration: 0` disables the transition (snap). The model already
+    /// defaults to `0.8` / `.easeInOut` (the app's doughnut morph); this modifier overrides it.
+    @inlinable
+    @MainActor
+    public func contentColorTransition(
+        duration: Double,
+        curve: GraphColorTransitionCurve = .easeInOut
+    ) -> Self {
+        self.model.colorTransitionDuration = duration
+        self.model.colorTransitionCurve = curve
+        return self
+    }
+}
