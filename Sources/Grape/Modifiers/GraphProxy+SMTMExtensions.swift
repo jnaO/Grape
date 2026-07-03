@@ -29,6 +29,23 @@ extension ForceDirectedGraphModel {
         guard let nodeID = nodeID as? NodeID else { return nil }
         return simulationContext.getKineticState(nodeID: nodeID)
     }
+
+    /// Move `nodeID` to `locationInViewportCoordinate` directly — a "static drag" that does NOT run the
+    /// simulation: it writes the node's position, zeroes its velocity, and repaints, but touches no
+    /// alpha/fixation and no forces, so a frozen (Reduce-Motion) graph responds immediately and nothing
+    /// else moves (overlaps are allowed). Contrast `setNodeFixation`, which only integrates on a tick and
+    /// re-heats alpha to re-settle the whole layout.
+    @inlinable
+    public func setNodePosition<ID>(nodeID: ID, locationInViewportCoordinate: CGPoint) where ID: Hashable {
+        guard let nodeID = nodeID as? NodeID,
+              let nodeIndex = simulationContext.nodeIndexLookup[nodeID] else { return }
+        let locationInSimulation = finalTransform.invert(locationInViewportCoordinate.simd)
+        simulationContext.storage.kinetics.position[nodeIndex] = locationInSimulation
+        simulationContext.storage.kinetics.velocity[nodeIndex] = .zero
+        withMutation(keyPath: \.currentFrame) {
+            currentFrame += 1
+        }
+    }
 }
 
 @MainActor
@@ -46,5 +63,12 @@ extension GraphProxy {
     @inlinable
     public func kineticState<ID: Hashable>(of nodeID: ID) -> KineticState? {
         storage?.kineticState(of: nodeID)
+    }
+
+    /// Move `nodeID` to a viewport point directly, without running the simulation — see the model-level
+    /// `setNodePosition` for semantics (a static, non-propagating drag for the Reduce-Motion map).
+    @inlinable
+    public func setNodePosition<ID: Hashable>(nodeID: ID, locationInViewportCoordinate: CGPoint) {
+        storage?.setNodePosition(nodeID: nodeID, locationInViewportCoordinate: locationInViewportCoordinate)
     }
 }

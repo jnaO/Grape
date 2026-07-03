@@ -16,6 +16,13 @@ public protocol _AnyGraphProxyProtocol {
     @inlinable
     func setNodeFixation<ID: Hashable>(nodeID: ID, fixation: CGPoint?, minimumAlpha: Double)
 
+    /// SMTM fork: directly move a node to a viewport point WITHOUT touching alpha, fixation, or any
+    /// force — zeroes the node's velocity and repaints. Unlike `setNodeFixation` (which only takes
+    /// effect during a tick and re-heats alpha), this reflects immediately on a frozen sim and never
+    /// propagates to neighbours — a "static drag" for the Reduce-Motion map.
+    @inlinable
+    func setNodePosition<ID: Hashable>(nodeID: ID, locationInViewportCoordinate: CGPoint)
+
     /// The node's live position in **simulation** coordinates, or `nil` if the node is unknown.
     /// Map to the viewport with `finalTransform` if a screen-space value is needed.
     @inlinable
