@@ -269,6 +269,15 @@ public final class ForceDirectedGraphModel<NodeID: Hashable> {
     @MainActor
     var nodeFadeTimer: Timer? = nil
 
+    /// SMTM fork: `ticksOnAppear` is consumed exactly once, lazily, on the first `render` — so the very
+    /// first painted frame already reflects the fast-forwarded (e.g. fully settled) layout. Upstream ran
+    /// it in `trackStateMixin`'s `Task`, one runloop *after* the first paint, so the raw seed flashed and
+    /// the settled frame landed only after the (main-thread) ticks completed. `render` runs only on the
+    /// live model, so ticking here can't re-run per parent-body re-eval the way an `init`-time tick would.
+    /// Both sites are guarded by this flag (whichever runs first wins; `render` wins in practice).
+    @usableFromInline
+    var ticksOnAppearConsumed: Bool = false
+
     @usableFromInline
     var _onTicked: ((UInt) -> Void)? = nil
 
@@ -342,14 +351,15 @@ public final class ForceDirectedGraphModel<NodeID: Hashable> {
     @inlinable
     func trackStateMixin() {
         Task { @MainActor [self] in
-            switch stateMixinRef.ticksOnAppear {
-            case .iteration(let count):
-                simulationContext.storage.tick(ticks: .iteration(count))
-            case .untilReachingAlpha(let alpha):
-                simulationContext.storage.tick(ticks: .untilReachingAlpha(alpha))
-            }
-            withMutation(keyPath: \.currentFrame) {
-                currentFrame += 1
+            // SMTM fork: only tick here if `render` hasn't already consumed `ticksOnAppear`. The first
+            // `render` normally wins (this Task is a runloop behind the first paint), which is the whole
+            // point — but keep this path as a fallback for the rare case a model is mixed in without ever
+            // rendering. Consume-once either way.
+            if !ticksOnAppearConsumed {
+                consumeTicksOnAppearIfNeeded()
+                withMutation(keyPath: \.currentFrame) {
+                    currentFrame += 1
+                }
             }
         }
 
@@ -552,6 +562,22 @@ extension ForceDirectedGraphModel {
 
     // MARK: - SMTM node fade-in
 
+    /// SMTM fork: run `stateMixinRef.ticksOnAppear` synchronously, exactly once. Called at the top of the
+    /// first `render` (before positions are read) so the first painted frame is the fast-forwarded layout;
+    /// also called from `trackStateMixin`'s Task as a fallback. `.iteration(0)` (the upstream default) is a
+    /// no-op beyond flipping the flag, so default consumers pay nothing and behave exactly as before.
+    @inlinable
+    func consumeTicksOnAppearIfNeeded() {
+        guard !ticksOnAppearConsumed else { return }
+        ticksOnAppearConsumed = true
+        switch stateMixinRef.ticksOnAppear {
+        case .iteration(let count):
+            simulationContext.storage.tick(ticks: .iteration(count))
+        case .untilReachingAlpha(let alpha):
+            simulationContext.storage.tick(ticks: .untilReachingAlpha(alpha))
+        }
+    }
+
     /// Record a first-seen timestamp for every currently-drawn node that doesn't have one yet, so newly
     /// appeared nodes (initial build or a `revive`-added tier) begin their fade from `now`. No-op when
     /// the fade is disabled (`duration == 0`) — zero cost on the default path.
@@ -622,6 +648,10 @@ extension ForceDirectedGraphModel {
         // should not invoke `access`, but actually does now ?
         // print("Rendering frame \(_$currentFrame.rawValue)")
         obsoleteState.cgSize = size
+
+        // SMTM fork: fast-forward `ticksOnAppear` before the first frame's positions are read, so frame 1
+        // paints the settled layout (no seed flash / no post-onAppear wait). Consume-once; no-op after.
+        consumeTicksOnAppearIfNeeded()
 
         let transform = modelTransform.translate(by: size.simd / 2)
         // debugPrint(transform.scale)
